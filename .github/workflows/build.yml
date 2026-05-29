@@ -26,7 +26,7 @@ jobs:
           arduino-cli lib install "ArduinoJson"
       - name: Compile firmware
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32 --output-dir build/ sketch/
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --output-dir build/ sketch/
       - name: Rename output files
         run: |
           cp build/sketch.ino.bin build/customfirmware.bin
