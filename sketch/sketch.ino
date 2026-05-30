@@ -3,12 +3,26 @@
 #include <WebServer.h>
 #include <esp_bt.h>       // For Bluetooth disable
 #include <esp_wifi.h>     // For WiFi power save
+#include <esp_pm.h>       // For automatic light sleep
+#include <time.h>         // For NTP / night mode
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+
+// Set to 1 to re-enable Serial output for debugging
+#define DEBUG_LOG 0
+#if DEBUG_LOG
+  #define DLOG(x)   DLOG(x)
+  #define DLOGLN(x) DLOGLN(x)
+  #define DBEGIN()  Serial.begin(115200)
+#else
+  #define DLOG(x)
+  #define DLOGLN(x)
+  #define DBEGIN()
+#endif
 
 // Project Details
 String buildNumber = "v1.1.1";
@@ -20,7 +34,6 @@ String buildNumber = "v1.1.1";
 #define LED_PIN 32
 #define BUZZER 15
 #define LIGHT_SENSOR 35
-#define BATTERY_ADC 34  // Battery voltage monitoring
 
 // Matrix configuration
 #define MATRIX_WIDTH 32
@@ -30,13 +43,6 @@ String buildNumber = "v1.1.1";
 
 // Screen configuration
 #define MAX_SCREENS 5
-
-// Battery configuration
-#define BATTERY_MIN_VOLTAGE 3.0  // Minimum battery voltage (empty)
-#define BATTERY_MAX_VOLTAGE 4.2  // Maximum battery voltage (full)
-#define BATTERY_SAMPLES 10       // Number of samples to average
-#define BATTERY_LOW_THRESHOLD 20 // Low battery warning at 20%
-#define BATTERY_CRITICAL_THRESHOLD 10 // Critical battery at 10%
 
 // Create matrix object
 Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
@@ -90,14 +96,12 @@ int manualBrightness = 40; // 0-255, used when autoBrightness is false
 unsigned long lastBrightnessUpdate = 0;
 const int brightnessUpdateInterval = 500; // Update brightness every 500ms (ambient light changes slowly)
 
-// Battery monitoring
-float batteryVoltage = 0.0;
-int batteryPercentage = 0;
-unsigned long lastBatteryUpdate = 0;
-const unsigned long batteryUpdateInterval = 60000; // Update battery every 60 seconds
-bool showBatteryRequested = false;
-unsigned long batteryDisplayTime = 0;
-const unsigned long batteryDisplayDuration = 3000; // Show battery for 3 seconds
+// Night mode — 22:00 to 08:00 brightness capped at 30%
+const int NIGHT_START_HOUR   = 22;
+const int NIGHT_END_HOUR     = 8;
+const int DAY_MAX_BRIGHTNESS  = 102; // 40% of 255
+const int NIGHT_MAX_BRIGHTNESS = 76; // 30% of 255
+bool ntpSynced = false;
 
 // Authentication
 String adminPassword = "ulanzitc001"; // Default password
@@ -122,7 +126,7 @@ bool comboActionExecuted = false;
 // Scrolling text variables
 int16_t scrollX = MATRIX_WIDTH;
 unsigned long lastScrollUpdate = 0;
-const int scrollDelay = 80;  // ~12fps — smooth enough, saves CPU vs 20fps
+const int scrollDelay = 125;  // 8fps — minimal CPU/LED activity
 
 // Config mode flag and message
 bool inConfigMode = false;
@@ -149,8 +153,8 @@ void setup() {
   // Cuts CPU power draw by ~65%, major heat reduction
   setCpuFrequencyMhz(80);
 
-  Serial.begin(115200);
-  Serial.println("\n\nTC001 Custom Firmware " + buildNumber + " Starting...");
+  DBEGIN();
+  DLOGLN("\n\nTC001 Custom Firmware " + buildNumber + " Starting...");
   
   // Disable Bluetooth — not used, saves ~30mA and reduces heat
   esp_bt_controller_disable();
@@ -170,10 +174,10 @@ void setup() {
   // Set hostname for router identification
   WiFi.setHostname(deviceName.c_str());
   
-  Serial.print("Device Name: ");
-  Serial.println(deviceName);
-  Serial.print("MAC Address: ");
-  Serial.println(WiFi.macAddress());
+  DLOG("Device Name: ");
+  DLOGLN(deviceName);
+  DLOG("MAC Address: ");
+  DLOGLN(WiFi.macAddress());
   
   // Initialize buttons
   pinMode(BUTTON_1, INPUT_PULLUP);
@@ -181,7 +185,6 @@ void setup() {
   pinMode(BUTTON_3, INPUT_PULLUP);
   pinMode(BUZZER, OUTPUT);
   pinMode(LIGHT_SENSOR, INPUT); // Light sensor ADC input
-  pinMode(BATTERY_ADC, INPUT);  // Battery ADC input
   
   // Initialize LED matrix
   matrix.begin();
@@ -192,13 +195,8 @@ void setup() {
   // Show startup message
   displayScrollText(deviceName.c_str(), matrix.Color(0, 255, 0));
   
-  // Initial battery reading
-  updateBatteryStatus();
-  Serial.print("Initial Battery: ");
-  Serial.print(batteryVoltage);
-  Serial.print("V (");
-  Serial.print(batteryPercentage);
-  Serial.println("%)");
+  DLOG("V (");
+  DLOGLN("%)");
   
   // Load saved configuration
   loadConfiguration();
@@ -211,12 +209,13 @@ void setup() {
   String apName = "TC001-" + deviceID;
   wifiManager.setAPCallback(configModeCallback);
   
-  // Set a reasonable timeout (3 minutes)
+  // Set connection timeout to 20 seconds
+  wifiManager.setConnectTimeout(20);
   wifiManager.setConfigPortalTimeout(180);
   
   // Start autoConnect - this will block, but our task will handle display updates
   if (!wifiManager.autoConnect(apName.c_str())) {
-    Serial.println("Failed to connect and hit timeout");
+    DLOGLN("Failed to connect and hit timeout");
     
     // Stop display task if running
     if (displayTaskHandle != NULL) {
@@ -233,36 +232,51 @@ void setup() {
   if (displayTaskHandle != NULL) {
     vTaskDelete(displayTaskHandle);
     displayTaskHandle = NULL;
-    Serial.println("Display update task deleted");
+    DLOGLN("Display update task deleted");
   }
   inConfigMode = false;
   
   // Connected!
-  Serial.println("Connected to WiFi!");
+  DLOGLN("Connected to WiFi!");
   ipAddress = WiFi.localIP().toString();
-  Serial.print("IP Address: ");
-  Serial.println(ipAddress);
+  DLOG("IP Address: ");
+  DLOGLN(ipAddress);
 
   // Enable modem sleep — WiFi stays connected but radio sleeps between DTIM beacons
   // Reduces WiFi power draw by ~30-50%, significantly less heat
   WiFi.setSleep(true);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 
-  // Reduce TX power from 20dBm (100mW) to 11dBm (~12mW) — plenty for home use
-  WiFi.setTxPower(WIFI_POWER_11dBm);
+  // Reduce TX power to 2dBm — minimum, for router in the same room
+  WiFi.setTxPower(WIFI_POWER_2dBm);
+
+  // Enable automatic light sleep — CPU halts during delay() and idle time
+  // Requires modem sleep to be active (already set above)
+  // max=80MHz (already set), min=40MHz when idle, light_sleep=true
+  esp_pm_config_esp32_t pm_config = {
+    .max_freq_mhz = 80,
+    .min_freq_mhz = 40,
+    .light_sleep_enable = true
+  };
+  esp_pm_configure(&pm_config);
+
+  // Sync time via NTP for night mode (Europe/Warsaw with auto DST)
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.google.com");
+  struct tm timeinfo;
+  ntpSynced = getLocalTime(&timeinfo, 5000); // wait up to 5s for sync
   
   displayScrollText(ipAddress.c_str(), matrix.Color(0, 255, 0));
   
   // Setup web server routes
   setupWebServer();
   server.begin();
-  Serial.println("Web server started");
+  DLOGLN("Web server started");
   
   displayScrollText("READY", matrix.Color(0, 255, 255));
   
   // Poll active screen immediately if configured
   if (numScreens > 0 && screens[activeScreen].apiConfigured) {
-    Serial.println("Performing initial API poll for active screen...");
+    DLOGLN("Performing initial API poll for active screen...");
     pollScreenAPI(activeScreen);
     screens[activeScreen].lastAPICall = millis();
   }
@@ -290,20 +304,12 @@ void loop() {
     lastBrightnessUpdate = millis();
   }
   
-  // Update battery status periodically
-  if (millis() - lastBatteryUpdate > batteryUpdateInterval) {
-    updateBatteryStatus();
-    lastBatteryUpdate = millis();
   }
   
-  // Check if battery display time has elapsed
-  if (showBatteryRequested && (millis() - batteryDisplayTime > batteryDisplayDuration)) {
-    showBatteryRequested = false;
-    scrollX = MATRIX_WIDTH; // Reset scroll for normal display
   }
 
   // Auto-rotate screens
-  if (autoRotate && numScreens > 1 && !showBatteryRequested) {
+  if (autoRotate && numScreens > 1) {
     if (millis() - lastRotateTime > (unsigned long)(rotateInterval * 1000)) {
       nextScreen();
       lastRotateTime = millis();
@@ -318,150 +324,28 @@ void loop() {
     }
   }
 
-  // Continuously scroll the current value or battery info
   if (millis() - lastScrollUpdate > scrollDelay) {
-    if (showBatteryRequested) {
-      scrollBatteryDisplay();
     } else {
       scrollCurrentValue();
     }
     lastScrollUpdate = millis();
   }
 
-  delay(10);
+  // 50ms gives light sleep enough time to engage between loop iterations
+  // All timing uses millis() so this doesn't affect scroll/brightness/API intervals
+  delay(50);
 }
 
 // ============================================
-// Battery Monitoring Functions
 // ============================================
 
-void updateBatteryStatus() {
   // Take multiple samples and average them for more stable readings
   long sum = 0;
-  for (int i = 0; i < BATTERY_SAMPLES; i++) {
-    sum += analogRead(BATTERY_ADC);
     delay(5);
   }
-  int rawValue = sum / BATTERY_SAMPLES;
   
   // Convert ADC reading to voltage
   // ESP32 ADC is 12-bit (0-4095) with 3.3V reference
-  // Adjust the multiplier based on your voltage divider ratio
-  // Common TC001 voltage divider is 2:1, so multiply by 2
-  batteryVoltage = (rawValue / 4095.0) * 3.3 * 2.0;
-  
-  // Apply calibration offset if needed (measure actual voltage and adjust)
-  // batteryVoltage += 0.1; // Example: add 0.1V if readings are consistently low
-  
-  // Calculate percentage using voltage curve
-  batteryPercentage = calculateBatteryPercentage(batteryVoltage);
-  
-  // Debug output
-  Serial.print("Battery: ");
-  Serial.print(batteryVoltage, 2);
-  Serial.print("V (");
-  Serial.print(batteryPercentage);
-  Serial.print("%) - Raw ADC: ");
-  Serial.println(rawValue);
-  
-  // Check for low battery warning
-  if (batteryPercentage <= BATTERY_CRITICAL_THRESHOLD && batteryPercentage > 0) {
-    // Critical battery - beep twice
-    tone(BUZZER, 2000, 100);
-    delay(150);
-    tone(BUZZER, 2000, 100);
-  } else if (batteryPercentage <= BATTERY_LOW_THRESHOLD && batteryPercentage > 0) {
-    // Low battery - single beep (only once per boot)
-    static bool lowBatteryWarned = false;
-    if (!lowBatteryWarned) {
-      tone(BUZZER, 1500, 200);
-      lowBatteryWarned = true;
-    }
-  }
-}
-
-int calculateBatteryPercentage(float voltage) {
-  // LiPo voltage curve (approximate)
-  // 4.2V = 100%, 3.7V = 50%, 3.0V = 0%
-  
-  if (voltage >= BATTERY_MAX_VOLTAGE) {
-    return 100;
-  } else if (voltage <= BATTERY_MIN_VOLTAGE) {
-    return 0;
-  }
-  
-  // Non-linear mapping for more accurate LiPo curve
-  // LiPo batteries have a relatively flat discharge curve from 100% to 20%,
-  // then drop quickly from 20% to 0%
-  
-  if (voltage > 3.9) {
-    // 100% to 75% range (4.2V to 3.9V)
-    return map(voltage * 100, 390, 420, 75, 100);
-  } else if (voltage > 3.7) {
-    // 75% to 40% range (3.9V to 3.7V)
-    return map(voltage * 100, 370, 390, 40, 75);
-  } else if (voltage > 3.5) {
-    // 40% to 15% range (3.7V to 3.5V)
-    return map(voltage * 100, 350, 370, 15, 40);
-  } else {
-    // 15% to 0% range (3.5V to 3.0V)
-    return map(voltage * 100, 300, 350, 0, 15);
-  }
-}
-
-void scrollBatteryDisplay() {
-  String batteryText = String(batteryPercentage) + "% ";
-  
-  // Choose color based on battery level
-  uint16_t color;
-  if (batteryPercentage <= BATTERY_CRITICAL_THRESHOLD) {
-    color = matrix.Color(255, 0, 0); // Red for critical
-  } else if (batteryPercentage <= BATTERY_LOW_THRESHOLD) {
-    color = matrix.Color(255, 165, 0); // Orange for low
-  } else {
-    color = matrix.Color(0, 255, 0); // Green for good
-  }
-  
-  matrix.fillScreen(0);
-  matrix.setTextColor(color);
-  
-  bool useScroll = (numScreens > 0) ? screens[activeScreen].scrollEnabled : true;
-  if (useScroll) {
-    // Scrolling mode
-    int16_t textWidth = batteryText.length() * 6;
-
-    matrix.setCursor(scrollX, 0);
-    matrix.print(batteryText);
-    matrix.show();
-
-    scrollX--;
-    if (scrollX < -textWidth) {
-      scrollX = MATRIX_WIDTH;
-    }
-  } else {
-    // Static mode - center the text
-    int16_t x1, y1;
-    uint16_t w, h;
-    matrix.getTextBounds(batteryText.c_str(), 0, 0, &x1, &y1, &w, &h);
-    int16_t centerX = (MATRIX_WIDTH - w) / 2;
-
-    matrix.setCursor(centerX, 0);
-    matrix.print(batteryText);
-    matrix.show();
-  }
-}
-
-void showBatteryOnDisplay() {
-  showBatteryRequested = true;
-  batteryDisplayTime = millis();
-  scrollX = MATRIX_WIDTH; // Reset scroll position
-  updateBatteryStatus(); // Get latest reading
-  Serial.println("Battery display requested via button press");
-}
-
-// ============================================
-// Original Functions (with battery integration)
-// ============================================
 
 void loadConfiguration() {
   preferences.begin("tc001", false);
@@ -479,7 +363,7 @@ void loadConfiguration() {
   if (numScreens == 0) {
     String oldEndpoint = preferences.getString("apiUrl", "");
     if (oldEndpoint.length() > 0) {
-      Serial.println("Migrating old single-screen config to multi-screen format...");
+      DLOGLN("Migrating old single-screen config to multi-screen format...");
       screens[0].name = "Screen 1";
       screens[0].apiEndpoint = oldEndpoint;
       screens[0].apiKey = preferences.getString("apiKey", "");
@@ -487,7 +371,7 @@ void loadConfiguration() {
       screens[0].jsonPath = preferences.getString("jsonPath", "");
       screens[0].displayPrefix = preferences.getString("prefix", "");
       screens[0].displaySuffix = preferences.getString("suffix", "");
-      screens[0].pollingInterval = preferences.getInt("interval", 60);
+      screens[0].pollingInterval = preferences.getInt("interval", 600);
       screens[0].scrollEnabled = preferences.getBool("scroll", true);
       screens[0].iconData = preferences.getString("iconData", "");
       numScreens = 1;
@@ -509,7 +393,7 @@ void loadConfiguration() {
       preferences.putInt("activeScr", activeScreen);
       saveScreenToPrefs(0);
 
-      Serial.println("Migration complete");
+      DLOGLN("Migration complete");
     }
   }
 
@@ -523,7 +407,7 @@ void loadConfiguration() {
     screens[i].jsonPath = preferences.getString(("s" + idx + "path").c_str(), "");
     screens[i].displayPrefix = preferences.getString(("s" + idx + "pfx").c_str(), "");
     screens[i].displaySuffix = preferences.getString(("s" + idx + "sfx").c_str(), "");
-    screens[i].pollingInterval = preferences.getInt(("s" + idx + "intv").c_str(), 60);
+    screens[i].pollingInterval = preferences.getInt(("s" + idx + "intv").c_str(), 600);
     screens[i].scrollEnabled = preferences.getBool(("s" + idx + "scrl").c_str(), true);
     screens[i].iconData = preferences.getString(("s" + idx + "icon").c_str(), "");
 
@@ -552,15 +436,15 @@ void loadConfiguration() {
     matrix.setBrightness(manualBrightness);
   }
 
-  Serial.println("Configuration loaded:");
-  Serial.println("  Screens: " + String(numScreens));
-  Serial.println("  Active: " + String(activeScreen));
-  Serial.println("  Auto Rotate: " + String(autoRotate ? "Yes" : "No"));
-  Serial.println("  Rotate Interval: " + String(rotateInterval) + "s");
+  DLOGLN("Configuration loaded:");
+  DLOGLN("  Screens: " + String(numScreens));
+  DLOGLN("  Active: " + String(activeScreen));
+  DLOGLN("  Auto Rotate: " + String(autoRotate ? "Yes" : "No"));
+  DLOGLN("  Rotate Interval: " + String(rotateInterval) + "s");
   for (int i = 0; i < numScreens; i++) {
-    Serial.println("  Screen " + String(i) + ": " + screens[i].name);
-    Serial.println("    Endpoint: " + screens[i].apiEndpoint);
-    Serial.println("    Configured: " + String(screens[i].apiConfigured ? "Yes" : "No"));
+    DLOGLN("  Screen " + String(i) + ": " + screens[i].name);
+    DLOGLN("    Endpoint: " + screens[i].apiEndpoint);
+    DLOGLN("    Configured: " + String(screens[i].apiConfigured ? "Yes" : "No"));
   }
 }
 
@@ -610,7 +494,7 @@ void saveAllConfiguration() {
   }
 
   preferences.end();
-  Serial.println("All configuration saved");
+  DLOGLN("All configuration saved");
 }
 
 // HTML escape function to prevent HTML injection and attribute breaking
@@ -690,13 +574,13 @@ void checkButtons() {
       currentCombo = pressedCombo;
       comboPressStartTime = millis();
       comboActionExecuted = false;
-      Serial.println("Button press detected: " + String(pressedCombo));
+      DLOGLN("Button press detected: " + String(pressedCombo));
     } else if (currentCombo != pressedCombo) {
       // Combination changed (e.g., started with btn2, then pressed btn3 too)
       currentCombo = pressedCombo;
       comboPressStartTime = millis();
       comboActionExecuted = false;
-      Serial.println("Button combo changed to: " + String(pressedCombo));
+      DLOGLN("Button combo changed to: " + String(pressedCombo));
     } else {
       // Same combo still held - check for long press actions
       unsigned long holdTime = millis() - comboPressStartTime;
@@ -706,25 +590,20 @@ void checkButtons() {
           case COMBO_BTN123:
             // All 3 buttons - Factory reset after 3 seconds
             if (holdTime >= 3000) {
-              Serial.println("Factory reset triggered (3s hold)");
+              DLOGLN("Factory reset triggered (3s hold)");
               performFactoryReset();
               comboActionExecuted = true;
             }
             break;
 
           case COMBO_BTN23:
-            // Button 2 + 3 - Show battery after 500ms
-            if (holdTime >= 500) {
-              Serial.println("Battery display triggered (0.5s hold)");
-              showBatteryOnDisplay();
-              comboActionExecuted = true;
-            }
+            // Button 2+3 — battery display disabled
             break;
 
           case COMBO_BTN2:
             // Button 2 solo - Manual API refresh after 1 second
             if (holdTime >= 1000) {
-              Serial.println("Manual API refresh triggered (1s hold)");
+              DLOGLN("Manual API refresh triggered (1s hold)");
               if (numScreens > 0 && screens[activeScreen].apiConfigured) {
                 pollScreenAPI(activeScreen);
                 screens[activeScreen].lastAPICall = millis();
@@ -743,15 +622,15 @@ void checkButtons() {
     // No buttons pressed - handle release events
     if (currentCombo != COMBO_NONE) {
       unsigned long holdTime = millis() - comboPressStartTime;
-      Serial.println("Button released after " + String(holdTime) + "ms");
+      DLOGLN("Button released after " + String(holdTime) + "ms");
 
       // Short press actions (only if no long press action was executed)
       if (!comboActionExecuted) {
         if (currentCombo == COMBO_BTN1 && holdTime < 500) {
-          Serial.println("Short press Button 1 - previous screen");
+          DLOGLN("Short press Button 1 - previous screen");
           prevScreen();
         } else if (currentCombo == COMBO_BTN3 && holdTime < 500) {
-          Serial.println("Short press Button 3 - next screen");
+          DLOGLN("Short press Button 3 - next screen");
           nextScreen();
         }
       }
@@ -764,7 +643,7 @@ void checkButtons() {
 }
 
 void performFactoryReset() {
-  Serial.println("Factory reset initiated!");
+  DLOGLN("Factory reset initiated!");
   
   // Beep twice to confirm
   tone(BUZZER, 2000, 200);
@@ -787,7 +666,7 @@ void performFactoryReset() {
 
 void checkConfigMode() {
   if (digitalRead(BUTTON_1) == LOW) {
-    Serial.println("Button 1 held - entering config mode");
+    DLOGLN("Button 1 held - entering config mode");
     WiFiManager wifiManager;
     wifiManager.resetSettings();
     delay(500);
@@ -795,7 +674,7 @@ void checkConfigMode() {
 }
 
 void configModeCallback(WiFiManager *myWiFiManager) {
-  Serial.println("Entered config mode");
+  DLOGLN("Entered config mode");
   inConfigMode = true;
   configModeMessage = "CONFIG: " + String(myWiFiManager->getConfigPortalSSID());
   
@@ -810,7 +689,7 @@ void configModeCallback(WiFiManager *myWiFiManager) {
     1
   );
   
-  Serial.println("Display update task created");
+  DLOGLN("Display update task created");
   scrollX = MATRIX_WIDTH;
 }
 
@@ -848,7 +727,7 @@ void onScreenSwitch() {
   preferences.putInt("activeScr", activeScreen);
   preferences.end();
 
-  Serial.println("Switched to screen " + String(activeScreen) + ": " + screens[activeScreen].name);
+  DLOGLN("Switched to screen " + String(activeScreen) + ": " + screens[activeScreen].name);
 }
 
 // ============================================
@@ -861,13 +740,13 @@ void pollScreenAPI(int index) {
   if (!scr.apiConfigured) return;
 
   const int MAX_RETRIES = 2;
-  const int TIMEOUT_MS = 10000;
+  const int TIMEOUT_MS = 20000; // 20s HTTP timeout
   int retryCount = 0;
   bool success = false;
 
   while (retryCount <= MAX_RETRIES && !success) {
     if (retryCount > 0) {
-      Serial.println("Retry attempt " + String(retryCount) + " of " + String(MAX_RETRIES));
+      DLOGLN("Retry attempt " + String(retryCount) + " of " + String(MAX_RETRIES));
       delay(1000);
     }
 
@@ -876,28 +755,30 @@ void pollScreenAPI(int index) {
     HTTPClient http;
     http.begin(encodedUrl);
     http.setTimeout(TIMEOUT_MS);
+    http.setReuse(true);
+    http.useHTTP10(true);
 
     if (scr.apiKey.length() > 0) {
       http.addHeader(scr.apiHeaderName, scr.apiKey);
     }
 
-    Serial.println("[Screen " + String(index) + "] Polling: " + scr.apiEndpoint);
+    DLOGLN("[Screen " + String(index) + "] Polling: " + scr.apiEndpoint);
     if (encodedUrl != scr.apiEndpoint) {
-      Serial.println("Encoded URL: " + encodedUrl);
+      DLOGLN("Encoded URL: " + encodedUrl);
     }
     int httpCode = http.GET();
 
     if (httpCode > 0) {
       if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
-        Serial.println("[Screen " + String(index) + "] Response: " + String(payload.length()) + " bytes");
+        DLOGLN("[Screen " + String(index) + "] Response: " + String(payload.length()) + " bytes");
 
         String value = extractJSONValue(payload, scr.jsonPath);
 
         if (value.length() > 0) {
           scr.currentValue = scr.displayPrefix + value + scr.displaySuffix;
           scr.lastError = "";
-          Serial.println("[Screen " + String(index) + "] Value: " + scr.currentValue);
+          DLOGLN("[Screen " + String(index) + "] Value: " + scr.currentValue);
           if (index == activeScreen) {
             scrollX = MATRIX_WIDTH;
             displayDirty = true;
@@ -917,7 +798,7 @@ void pollScreenAPI(int index) {
       }
     } else {
       String errorMsg = http.errorToString(httpCode);
-      Serial.println("[Screen " + String(index) + "] Connection failed: " + errorMsg);
+      DLOGLN("[Screen " + String(index) + "] Connection failed: " + errorMsg);
 
       if (retryCount == MAX_RETRIES) {
         scr.currentValue = "CONN FAIL";
@@ -931,17 +812,17 @@ void pollScreenAPI(int index) {
   }
 
   if (!success) {
-    Serial.println("[Screen " + String(index) + "] Failed after " + String(MAX_RETRIES + 1) + " attempts");
+    DLOGLN("[Screen " + String(index) + "] Failed after " + String(MAX_RETRIES + 1) + " attempts");
   }
 }
 
 String extractJSONValue(const String& json, const String& path) {
-  DynamicJsonDocument doc(4096);
+  DynamicJsonDocument doc(512);
   DeserializationError error = deserializeJson(doc, json);
   
   if (error) {
-    Serial.print("JSON parse error: ");
-    Serial.println(error.c_str());
+    DLOG("JSON parse error: ");
+    DLOGLN(error.c_str());
     return "";
   }
   
@@ -961,7 +842,7 @@ String extractJSONValue(const String& json, const String& path) {
       
       int closeBracket = workingPath.indexOf(']');
       if (closeBracket < 0) {
-        Serial.println("Malformed path: missing ]");
+        DLOGLN("Malformed path: missing ]");
         return "";
       }
       
@@ -996,7 +877,7 @@ String extractJSONValue(const String& json, const String& path) {
           }
           
           if (!found) {
-            Serial.println("No matching item found in array");
+            DLOGLN("No matching item found in array");
             return "";
           }
         }
@@ -1007,7 +888,7 @@ String extractJSONValue(const String& json, const String& path) {
           if (index >= 0 && index < arr.size()) {
             current = arr[index];
           } else {
-            Serial.println("Array index out of bounds");
+            DLOGLN("Array index out of bounds");
             return "";
           }
         }
@@ -1024,7 +905,7 @@ String extractJSONValue(const String& json, const String& path) {
       if (current.is<JsonObject>()) {
         current = current[segment];
       } else {
-        Serial.println("Expected object at segment: " + segment);
+        DLOGLN("Expected object at segment: " + segment);
         return "";
       }
     } else {
@@ -1047,7 +928,7 @@ String extractJSONValue(const String& json, const String& path) {
     return current.as<bool>() ? "true" : "false";
   }
   
-  Serial.println("Value is not a primitive type");
+  DLOGLN("Value is not a primitive type");
   return "";
 }
 
@@ -1150,22 +1031,22 @@ void parseIconData(const String& jsonData, uint16_t pixelArray[64], bool& enable
   DeserializationError error = deserializeJson(doc, jsonData);
 
   if (error) {
-    Serial.print("Icon parse error: ");
-    Serial.println(error.c_str());
+    DLOG("Icon parse error: ");
+    DLOGLN(error.c_str());
     enabled = false;
     return;
   }
 
   if (!doc.is<JsonArray>()) {
-    Serial.println("Icon data is not an array");
+    DLOGLN("Icon data is not an array");
     enabled = false;
     return;
   }
 
   JsonArray pixels = doc.as<JsonArray>();
   if (pixels.size() != 64) {
-    Serial.print("Icon must have 64 pixels, got: ");
-    Serial.println(pixels.size());
+    DLOG("Icon must have 64 pixels, got: ");
+    DLOGLN(pixels.size());
     enabled = false;
     return;
   }
@@ -1173,8 +1054,8 @@ void parseIconData(const String& jsonData, uint16_t pixelArray[64], bool& enable
   for (int i = 0; i < 64; i++) {
     JsonArray pixel = pixels[i];
     if (!pixel || pixel.size() < 3) {
-      Serial.print("Invalid pixel at index: ");
-      Serial.println(i);
+      DLOG("Invalid pixel at index: ");
+      DLOGLN(i);
       enabled = false;
       return;
     }
@@ -1187,7 +1068,7 @@ void parseIconData(const String& jsonData, uint16_t pixelArray[64], bool& enable
   }
 
   enabled = true;
-  Serial.println("Icon parsed successfully (64 pixels)");
+  DLOGLN("Icon parsed successfully (64 pixels)");
 }
 
 // ============================================
@@ -1277,11 +1158,11 @@ void handleLoginPost() {
   if (password == adminPassword) {
     isAuthenticated = true;
     authTimestamp = millis();
-    Serial.println("Login successful");
+    DLOGLN("Login successful");
     server.sendHeader("Location", "/");
     server.send(303);
   } else {
-    Serial.println("Login failed - incorrect password");
+    DLOGLN("Login failed - incorrect password");
     server.sendHeader("Location", "/login?failed=1");
     server.send(303);
   }
@@ -1290,7 +1171,7 @@ void handleLoginPost() {
 void handleLogout() {
   isAuthenticated = false;
   authTimestamp = 0;
-  Serial.println("User logged out");
+  DLOGLN("User logged out");
   server.sendHeader("Location", "/login");
   server.send(303);
 }
@@ -1491,7 +1372,7 @@ void handleBackupDownload() {
   serializeJson(doc, output);
 
   server.send(200, "application/json", output);
-  Serial.println("Backup created and downloaded");
+  DLOGLN("Backup created and downloaded");
 }
 
 void handleBackupRestore() {
@@ -1503,7 +1384,7 @@ void handleBackupRestore() {
   if (error) {
     String response = "{\"success\":false,\"message\":\"Invalid JSON format\"}";
     server.send(400, "application/json", response);
-    Serial.println("Restore failed: Invalid JSON");
+    DLOGLN("Restore failed: Invalid JSON");
     return;
   }
 
@@ -1563,7 +1444,7 @@ void handleBackupRestore() {
   String response = "{\"success\":true,\"message\":\"Configuration restored successfully\"}";
   server.send(200, "application/json", response);
 
-  Serial.println("Configuration restored from backup");
+  DLOGLN("Configuration restored from backup");
 
   delay(1000);
   ESP.restart();
@@ -1610,8 +1491,6 @@ void handleRoot() {
   html += "<div class='info-row'><span class='label'>WiFi SSID:</span><span class='value'>" + String(WiFi.SSID()) + "</span></div>";
   html += "<div class='info-row'><span class='label'>Signal Strength:</span><span class='value'>" + String(WiFi.RSSI()) + " dBm</span></div>";
   html += "<div class='info-row'><span class='label'>Firmware:</span><span class='value'>" + buildNumber + "</span></div>";
-  html += "<div class='info-row'><span class='label'>Battery Level:</span><span class='value' id='batteryPercent'>" + String(batteryPercentage) + "%</span></div>";
-  html += "<div class='info-row'><span class='label'>Voltage:</span><span class='value' id='batteryVoltage'>" + String(batteryVoltage, 2) + "V</span></div>";  
   
   // Screens Status
   html += "<h2>Screens Status</h2>";
@@ -1689,9 +1568,9 @@ void handleGeneralConfig() {
   
   html += "<div id='manualBrightnessGroup' style='display: " + String(autoBrightness ? "none" : "block") + ";'>";
   html += "<label>Manual Brightness:</label>";
-  html += "<input type='range' name='brightness' id='brightnessSlider' value='" + String(manualBrightness) + "' min='10' max='178' oninput='updateBrightnessLabel(this.value)'>";
+  html += "<input type='range' name='brightness' id='brightnessSlider' value='" + String(manualBrightness) + "' min='10' max='102' oninput='updateBrightnessLabel(this.value)'>";
   html += "<span id='brightnessValue'>" + String(manualBrightness) + "</span>";
-  html += "<p class='help'>Set brightness level (10-178, capped at 70% to reduce heat)</p>";
+  html += "<p class='help'>Set brightness level (10-102, capped at 40% to reduce heat)</p>";
   html += "</div>";
 
   // Auto-rotation section
@@ -1742,50 +1621,50 @@ void handleGeneralConfig() {
 
 void handleSaveGeneralConfig() {
   if (!requireAuth()) return;
-  Serial.println("=== Saving general configuration ===");
+  DLOGLN("=== Saving general configuration ===");
   
   // Debug: Show all received arguments
-  Serial.print("Number of arguments received: ");
-  Serial.println(server.args());
+  DLOG("Number of arguments received: ");
+  DLOGLN(server.args());
   for (int i = 0; i < server.args(); i++) {
-    Serial.print("  Arg ");
-    Serial.print(i);
-    Serial.print(": ");
-    Serial.print(server.argName(i));
-    Serial.print(" = ");
-    Serial.println(server.arg(i));
+    DLOG("  Arg ");
+    DLOG(i);
+    DLOG(": ");
+    DLOG(server.argName(i));
+    DLOG(" = ");
+    DLOGLN(server.arg(i));
   }
   
   autoBrightness = server.hasArg("autoBrightness");
-  Serial.print("Auto Brightness: ");
-  Serial.println(autoBrightness ? "ENABLED" : "DISABLED");
+  DLOG("Auto Brightness: ");
+  DLOGLN(autoBrightness ? "ENABLED" : "DISABLED");
   
   if (server.hasArg("brightness")) {
     int newBrightness = server.arg("brightness").toInt();
-    Serial.print("Brightness value received: ");
-    Serial.println(newBrightness);
+    DLOG("Brightness value received: ");
+    DLOGLN(newBrightness);
     
     manualBrightness = newBrightness;
     if (manualBrightness < 1) manualBrightness = 1;
     if (manualBrightness > 255) manualBrightness = 255;
     
-    Serial.print("Brightness value after validation: ");
-    Serial.println(manualBrightness);
+    DLOG("Brightness value after validation: ");
+    DLOGLN(manualBrightness);
   } else {
-    Serial.println("WARNING: No brightness argument received!");
+    DLOGLN("WARNING: No brightness argument received!");
   }
 
   // Auto-rotation settings
   autoRotate = server.hasArg("autoRotate");
-  Serial.print("Auto Rotate: ");
-  Serial.println(autoRotate ? "ENABLED" : "DISABLED");
+  DLOG("Auto Rotate: ");
+  DLOGLN(autoRotate ? "ENABLED" : "DISABLED");
 
   if (server.hasArg("rotateInterval")) {
     rotateInterval = server.arg("rotateInterval").toInt();
     if (rotateInterval < 3) rotateInterval = 3;
     if (rotateInterval > 300) rotateInterval = 300;
-    Serial.print("Rotate Interval: ");
-    Serial.println(rotateInterval);
+    DLOG("Rotate Interval: ");
+    DLOGLN(rotateInterval);
   }
 
   // Check if admin password should be changed
@@ -1793,12 +1672,12 @@ void handleSaveGeneralConfig() {
     String newPassword = server.arg("adminPassword");
     if (newPassword.length() > 0) {
       adminPassword = newPassword;
-      Serial.println("Admin password updated");
+      DLOGLN("Admin password updated");
     }
   }
 
   // Save to preferences
-  Serial.println("Writing to preferences...");
+  DLOGLN("Writing to preferences...");
   preferences.begin("tc001", false);
   preferences.putBool("autoBrightness", autoBrightness);
   preferences.putInt("brightness", manualBrightness);
@@ -1806,18 +1685,18 @@ void handleSaveGeneralConfig() {
   preferences.putBool("autoRotate", autoRotate);
   preferences.putInt("rotateIntv", rotateInterval);
   preferences.end();
-  Serial.println("Preferences written successfully");
+  DLOGLN("Preferences written successfully");
   
   // Apply brightness immediately
   if (!autoBrightness) {
-    Serial.print("Applying manual brightness: ");
-    Serial.println(manualBrightness);
+    DLOG("Applying manual brightness: ");
+    DLOGLN(manualBrightness);
     matrix.setBrightness(manualBrightness);
   } else {
-    Serial.println("Auto brightness enabled - will use light sensor");
+    DLOGLN("Auto brightness enabled - will use light sensor");
   }
   
-  Serial.println("=== General settings saved ===");
+  DLOGLN("=== General settings saved ===");
   
   // Redirect back to general config page
   server.sendHeader("Location", "/");
@@ -1996,7 +1875,7 @@ void handleScreenEditPage() {
 
   html += "<label>Polling Interval (seconds):</label>";
   html += "<input type='number' name='interval' value='" + String(scrInterval) + "' min='5' max='3600' required>";
-  html += "<p class='help'>How often to poll this screen's API (5-3600 seconds)</p>";
+  html += "<p class='help'>How often to poll this screen's API (default: 600s = 10 min)</p>";
 
   html += "<button type='submit' class='button'>Save Screen</button>";
   if (!isNew) {
@@ -2161,7 +2040,7 @@ void handleScreenSave() {
   saveScreenToPrefs(screenIdx);
   preferences.end();
 
-  Serial.println("Screen " + String(screenIdx) + " saved: " + scr.name);
+  DLOGLN("Screen " + String(screenIdx) + " saved: " + scr.name);
 
   // Poll immediately if configured
   if (scr.apiConfigured) {
@@ -2200,7 +2079,7 @@ void handleScreenDelete() {
     return;
   }
 
-  Serial.println("Deleting screen " + String(screenIdx) + ": " + screens[screenIdx].name);
+  DLOGLN("Deleting screen " + String(screenIdx) + ": " + screens[screenIdx].name);
 
   preferences.begin("tc001", false);
 
@@ -2272,19 +2151,21 @@ void handleTestAPI() {
     return;
   }
 
-  const int TIMEOUT_MS = 10000;
+  const int TIMEOUT_MS = 20000; // 20s HTTP timeout
 
-  Serial.println("[Test Screen " + String(screenIdx) + "] Testing API: " + scr.apiEndpoint);
+  DLOGLN("[Test Screen " + String(screenIdx) + "] Testing API: " + scr.apiEndpoint);
 
   String encodedUrl = urlEncode(scr.apiEndpoint);
 
   HTTPClient http;
   http.begin(encodedUrl);
   http.setTimeout(TIMEOUT_MS);
+  http.setReuse(true);
+  http.useHTTP10(true);
 
   if (scr.apiKey.length() > 0) {
     http.addHeader(scr.apiHeaderName, scr.apiKey);
-    Serial.println("Added header: " + scr.apiHeaderName);
+    DLOGLN("Added header: " + scr.apiHeaderName);
   }
 
   int httpCode = http.GET();
@@ -2317,12 +2198,12 @@ void handleTestAPI() {
   http.end();
 
   server.send(200, "text/plain", response);
-  Serial.println("Test API response sent");
+  DLOGLN("Test API response sent");
 }
 
 void handleRestart() {
   if (!requireAuth()) return;
-  Serial.println("Restart requested via web interface");
+  DLOGLN("Restart requested via web interface");
 
   String html = "<!DOCTYPE html><html><head>";
   html += "<meta charset='UTF-8'>";
@@ -2384,9 +2265,6 @@ void handleStatus() {
     s["icon_enabled"] = screens[i].iconEnabled;
   }
 
-  doc["battery_voltage"] = serialized(String(batteryVoltage, 2));
-  doc["battery_percentage"] = batteryPercentage;
-
   String json;
   serializeJson(doc, json);
   server.send(200, "application/json", json);
@@ -2412,6 +2290,14 @@ void displayScrollText(const char* text, uint16_t color) {
   }
 }
 
+bool isNightTime() {
+  if (!ntpSynced) return false;
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 100)) return false;
+  int h = timeinfo.tm_hour;
+  return (h >= NIGHT_START_HOUR || h < NIGHT_END_HOUR);
+}
+
 void updateBrightness() {
   int sensorValue = analogRead(LIGHT_SENSOR);
 
@@ -2426,9 +2312,11 @@ void updateBrightness() {
     rawBrightness = map(sensorValue, 3000, 4095, 120, 255);
   }
 
-  // Scale to 70% of original max (100% sensor → 178, 50% sensor → 89)
-  int brightness = (rawBrightness * 70) / 100;
-  brightness = constrain(brightness, 1, 178);
+  // Night mode (22:00–08:00): cap at 30% — day: cap at 40%
+  int maxBrightness = isNightTime() ? NIGHT_MAX_BRIGHTNESS : DAY_MAX_BRIGHTNESS;
+
+  int brightness = (rawBrightness * maxBrightness) / 255;
+  brightness = constrain(brightness, 1, maxBrightness);
 
   // Smooth transitions: move current brightness 20% toward target each update
   static int currentBrightness = 40;
