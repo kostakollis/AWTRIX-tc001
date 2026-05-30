@@ -122,12 +122,14 @@ bool comboActionExecuted = false;
 // Scrolling text variables
 int16_t scrollX = MATRIX_WIDTH;
 unsigned long lastScrollUpdate = 0;
-const int scrollDelay = 50;
+const int scrollDelay = 80;  // ~12fps — smooth enough, saves CPU vs 20fps
 
 // Config mode flag and message
 bool inConfigMode = false;
 String configModeMessage = "";
 TaskHandle_t displayTaskHandle = NULL;
+bool displayDirty = true;       // true = needs redraw; set false after static render
+String lastRenderedValue = "";  // track last drawn value to detect changes
 
 // Task for continuous display updates during config mode
 void displayUpdateTask(void * parameter) {
@@ -143,6 +145,10 @@ void displayUpdateTask(void * parameter) {
 }
 
 void setup() {
+  // Reduce CPU from 240MHz to 80MHz — WiFi works fine at 80MHz
+  // Cuts CPU power draw by ~65%, major heat reduction
+  setCpuFrequencyMhz(80);
+
   Serial.begin(115200);
   Serial.println("\n\nTC001 Custom Firmware " + buildNumber + " Starting...");
   
@@ -241,6 +247,9 @@ void setup() {
   // Reduces WiFi power draw by ~30-50%, significantly less heat
   WiFi.setSleep(true);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
+  // Reduce TX power from 20dBm (100mW) to 11dBm (~12mW) — plenty for home use
+  WiFi.setTxPower(WIFI_POWER_11dBm);
   
   displayScrollText(ipAddress.c_str(), matrix.Color(0, 255, 0));
   
@@ -831,6 +840,8 @@ void switchToScreen(int index) {
 void onScreenSwitch() {
   scrollX = MATRIX_WIDTH;
   lastRotateTime = millis(); // Reset auto-rotate timer
+  displayDirty = true;       // Force redraw on new screen
+  lastRenderedValue = "";
 
   // Save active screen preference
   preferences.begin("tc001", false);
@@ -889,16 +900,19 @@ void pollScreenAPI(int index) {
           Serial.println("[Screen " + String(index) + "] Value: " + scr.currentValue);
           if (index == activeScreen) {
             scrollX = MATRIX_WIDTH;
+            displayDirty = true;
           }
           success = true;
         } else {
           scr.currentValue = "PATH ERROR";
           scr.lastError = "Could not extract value from JSON path";
+          displayDirty = true;
           success = true;
         }
       } else {
         scr.currentValue = "HTTP " + String(httpCode);
         scr.lastError = "HTTP error: " + String(httpCode);
+        displayDirty = true;
         success = true;
       }
     } else {
@@ -908,6 +922,7 @@ void pollScreenAPI(int index) {
       if (retryCount == MAX_RETRIES) {
         scr.currentValue = "CONN FAIL";
         scr.lastError = errorMsg;
+        displayDirty = true;
       }
     }
 
@@ -1075,6 +1090,7 @@ void scrollCurrentValue() {
   matrix.setTextColor(color);
 
   if (scr.scrollEnabled) {
+    // Scrolling mode — must redraw every frame
     int iconOffset = scr.iconEnabled ? (ICON_WIDTH + 1) : 0;
     int16_t textWidth = scr.currentValue.length() * 6;
 
@@ -1097,8 +1113,10 @@ void scrollCurrentValue() {
       scrollX = MATRIX_WIDTH;
     }
   } else {
-    int displayWidth = scr.iconEnabled ? TEXT_WIDTH : MATRIX_WIDTH;
-    int xOffset = scr.iconEnabled ? ICON_WIDTH : 0;
+    // Static mode — skip redraw if nothing changed (saves LED power & CPU)
+    if (!displayDirty && scr.currentValue == lastRenderedValue) {
+      return;
+    }
 
     if (scr.iconEnabled) {
       for (int y = 0; y < 8; y++) {
@@ -1107,6 +1125,9 @@ void scrollCurrentValue() {
         }
       }
     }
+
+    int displayWidth = scr.iconEnabled ? TEXT_WIDTH : MATRIX_WIDTH;
+    int xOffset = scr.iconEnabled ? ICON_WIDTH : 0;
 
     int16_t x1, y1;
     uint16_t w, h;
@@ -1118,6 +1139,9 @@ void scrollCurrentValue() {
     matrix.setCursor(centerX, 0);
     matrix.print(scr.currentValue);
     matrix.show();
+
+    lastRenderedValue = scr.currentValue;
+    displayDirty = false;
   }
 }
 
