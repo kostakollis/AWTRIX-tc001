@@ -148,6 +148,41 @@ void displayUpdateTask(void * parameter) {
   }
 }
 
+// Forward declarations
+void scrollCurrentValue();
+void displayScrollText(const char* text, uint16_t color);
+void loadConfiguration();
+void checkConfigMode();
+void configModeCallback(WiFiManager *myWiFiManager);
+void setupWebServer();
+void pollScreenAPI(int index);
+void checkButtons();
+void updateBrightness();
+void saveScreenToPrefs(int index);
+void parseIconData(const String& data, uint16_t* pixels, bool& enabled);
+void performFactoryReset();
+void prevScreen();
+void nextScreen();
+void switchToScreen(int index);
+void onScreenSwitch();
+String extractJSONValue(const String& json, const String& path);
+void handleStatus();
+void handleFavicon();
+void handleRoot();
+void handleScreensPage();
+void handleScreenEditPage();
+void handleScreenSave();
+void handleScreenDelete();
+void handleScreenSetActive();
+void handleGeneralConfig();
+void handleSaveGeneralConfig();
+void handleTestAPI();
+void handleFactoryReset();
+void handleRestart();
+bool checkAuth();
+bool requireAuth();
+bool isNightTime();
+
 void setup() {
   // Reduce CPU from 240MHz to 80MHz — WiFi works fine at 80MHz
   // Cuts CPU power draw by ~65%, major heat reduction
@@ -297,15 +332,11 @@ void setup() {
 void loop() {
   server.handleClient();
   checkButtons();
-  
+
   // Update brightness if in auto mode
   if (autoBrightness && (millis() - lastBrightnessUpdate > brightnessUpdateInterval)) {
     updateBrightness();
     lastBrightnessUpdate = millis();
-  }
-  
-  }
-  
   }
 
   // Auto-rotate screens
@@ -324,28 +355,17 @@ void loop() {
     }
   }
 
+  // Scroll / redraw display
   if (millis() - lastScrollUpdate > scrollDelay) {
-    } else {
-      scrollCurrentValue();
-    }
+    scrollCurrentValue();
     lastScrollUpdate = millis();
   }
 
   // 50ms gives light sleep enough time to engage between loop iterations
-  // All timing uses millis() so this doesn't affect scroll/brightness/API intervals
   delay(50);
 }
 
-// ============================================
-// ============================================
 
-  // Take multiple samples and average them for more stable readings
-  long sum = 0;
-    delay(5);
-  }
-  
-  // Convert ADC reading to voltage
-  // ESP32 ADC is 12-bit (0-4095) with 3.3V reference
 
 void loadConfiguration() {
   preferences.begin("tc001", false);
