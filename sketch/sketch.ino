@@ -135,19 +135,6 @@ TaskHandle_t displayTaskHandle = NULL;
 bool displayDirty = true;       // true = needs redraw; set false after static render
 String lastRenderedValue = "";  // track last drawn value to detect changes
 
-// Task for continuous display updates during config mode
-void displayUpdateTask(void * parameter) {
-  while(true) {
-    if (inConfigMode) {
-      if (millis() - lastScrollUpdate > scrollDelay) {
-        scrollCurrentValue();
-        lastScrollUpdate = millis();
-      }
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS); // Delay 10ms
-  }
-}
-
 // Forward declarations
 void scrollCurrentValue();
 void displayScrollText(const char* text, uint16_t color);
@@ -182,6 +169,19 @@ void handleRestart();
 bool checkAuth();
 bool requireAuth();
 bool isNightTime();
+
+// Task for continuous display updates during config mode
+void displayUpdateTask(void * parameter) {
+  while(true) {
+    if (inConfigMode) {
+      if (millis() - lastScrollUpdate > scrollDelay) {
+        scrollCurrentValue();
+        lastScrollUpdate = millis();
+      }
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Delay 10ms
+  }
+}
 
 void setup() {
   // Reduce CPU from 240MHz to 80MHz — WiFi works fine at 80MHz
